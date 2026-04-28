@@ -1,0 +1,86 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Check if the requesting user has the deviceId in their /users/{uid}.devices array
+    function userOwnsDevice(deviceId) {
+      return isSignedIn() &&
+        deviceId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.devices;
+    }
+
+    // ─── USERS ───────────────────────────────────────────────────────────────
+
+    match /users/{userId} {
+      // A user can only read/write their own profile
+      allow get: if isSignedIn() && request.auth.uid == userId;
+
+      // On signup: create user doc with empty devices array
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasAll(['uid', 'email', 'devices'])
+        && request.resource.data.devices is list;
+
+      // Update: only allowed fields are displayName and devices array
+      allow update: if isSignedIn()
+        && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['displayName', 'devices']);
+    }
+
+    // ─── MEMBERS (subcollection of owner's user doc) ──────────────────────────
+
+    match /users/{ownerId}/members/{memberUid} {
+      // The owner can read/write their members list
+      allow read, write: if isSignedIn() && request.auth.uid == ownerId;
+
+      // A member can read their own entry (to know their role)
+      allow get: if isSignedIn() && request.auth.uid == memberUid;
+    }
+
+    // ─── DEVICES ─────────────────────────────────────────────────────────────
+
+    match /devices/{deviceId} {
+      // Any user who has this deviceId in their /users/{uid}.devices array can read it
+      allow get: if userOwnsDevice(deviceId);
+
+      // list is not needed — we always fetch by specific ID from the user's devices array
+      allow list: if false;
+
+      // The web app NEVER creates device documents — the ESP32 does via Admin SDK
+      allow create: if false;
+
+      // Users with access can update only name and settings
+      // Only the "owner" (first to pair) can update settings
+      allow update: if userOwnsDevice(deviceId)
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['name', 'settings', 'claimedAt']);
+
+      // ── History subcollection ──────────────────────────────────────────────
+      match /history/{recordId} {
+        // Readable by any user who has access to the device
+        allow read: if userOwnsDevice(deviceId);
+        // Written only by Admin SDK (ESP32 pipeline) — never by the web client
+        allow write: if false;
+      }
+
+      // ── Alerts subcollection ───────────────────────────────────────────────
+      match /alerts/{alertId} {
+        allow read: if userOwnsDevice(deviceId);
+        // Web client can only mark alerts as read
+        allow update: if userOwnsDevice(deviceId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+        // Creation only via Admin SDK
+        allow create, delete: if false;
+      }
+    }
+  }
+}

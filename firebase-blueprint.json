@@ -1,0 +1,119 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User profile. Owns the list of device IDs paired by this user.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "devices": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of device IDs (e.g. MF-A3F9) this user has access to"
+        }
+      },
+      "required": ["uid", "email", "devices"]
+    },
+    "Member": {
+      "title": "Family Member",
+      "description": "A user granted viewer access to one or more devices by the owner.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "role": { "type": "string", "enum": ["owner", "viewer"] },
+        "devices": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Subset of device IDs this member can see"
+        },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "role", "devices"]
+    },
+    "Device": {
+      "title": "Water Valve Device",
+      "description": "Represents one physical valve. Completely anonymous — no ownerId. Ownership is tracked on the User side.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique device code e.g. MF-A3F9, pre-flashed on the ESP32" },
+        "name": { "type": "string" },
+        "batteryVoltage": { "type": "number" },
+        "currentFlow": { "type": "number" },
+        "temperature": { "type": "number" },
+        "pressure": { "type": "number" },
+        "humidity": { "type": "number" },
+        "lastUpdate": { "type": "string", "format": "date-time" },
+        "claimedAt": { "type": "string", "format": "date-time", "description": "Timestamp of first pairing. Null if unclaimed." },
+        "settings": {
+          "type": "object",
+          "properties": {
+            "notificationsEnabled": { "type": "boolean" },
+            "emailAlerts": { "type": "boolean" },
+            "dailyThreshold": { "type": "number" },
+            "leakThreshold": { "type": "number" },
+            "nightStart": { "type": "string" },
+            "nightEnd": { "type": "string" }
+          }
+        }
+      },
+      "required": ["id"]
+    },
+    "Alert": {
+      "title": "System Alert",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["leak", "usage", "battery"] },
+        "severity": { "type": "string", "enum": ["info", "warning", "critical"] },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "isRead": { "type": "boolean" }
+      },
+      "required": ["type", "severity", "message", "timestamp"]
+    },
+    "HourlyRecord": {
+      "title": "Hourly Consumption Batch",
+      "description": "12 readings (every 5 min) sent every hour by the ESP32.",
+      "type": "object",
+      "properties": {
+        "timestamp": { "type": "string", "format": "date-time" },
+        "readings": { "type": "array", "items": { "type": "number" } },
+        "averageFlow": { "type": "number" },
+        "batteryVoltage": { "type": "number" },
+        "temperature": { "type": "number" }
+      },
+      "required": ["timestamp", "readings", "averageFlow"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile + array of paired device IDs"
+    },
+    "/users/{userId}/members/{memberUid}": {
+      "schema": "Member",
+      "description": "Family members granted access by the owner."
+    },
+    "/devices/{deviceId}": {
+      "schema": "Device",
+      "description": "Anonymous device. No ownerId. Ownership lives in /users/{uid}.devices[]"
+    },
+    "/devices/{deviceId}/history/{recordId}": {
+      "schema": "HourlyRecord"
+    },
+    "/devices/{deviceId}/alerts/{alertId}": {
+      "schema": "Alert"
+    }
+  },
+  "accessPatterns": {
+    "getUserDevices": "Read /users/{uid}.devices[] then for each ID read /devices/{deviceId}",
+    "pairDevice": "1) Verify /devices/{deviceId} exists  2) arrayUnion deviceId into /users/{uid}.devices  3) set claimedAt if null",
+    "shareWithMember": "1) Lookup target by email  2) setDoc /users/{ownerUid}/members/{memberUid}  3) arrayUnion deviceId into /users/{memberUid}.devices",
+    "removeMember": "1) delete /users/{ownerUid}/members/{memberUid}  2) arrayRemove owner's devices from /users/{memberUid}.devices",
+    "unclaimDevice": "arrayRemove deviceId from /users/{uid}.devices"
+  }
+}
