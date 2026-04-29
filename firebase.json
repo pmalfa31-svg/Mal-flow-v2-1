@@ -12,5 +12,9 @@
         "destination": "/index.html"
       }
     ]
+  },
+  "firestore": {
+    "database": "ai-studio-84d086fd-39aa-4a5a-8e4a-3cbfe54d98fd",
+    "rules": "firestore.rules"
   }
 }
