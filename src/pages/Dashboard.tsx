@@ -13,11 +13,11 @@ import {
 } from 'recharts';
 import { Link, useNavigate } from 'react-router-dom';
 import { cn } from '../lib/utils';
-import { auth, db, logout, handleFirestoreError } from '../lib/firebase';
+import { auth, db, logout, handleFirestoreError, pairDevice } from '../lib/firebase';
 import { useAuth } from '../lib/AuthContext';
 import { LogoutConfirmModal } from '../lib/LogoutConfirmModal';
 import { 
-  doc, onSnapshot, updateDoc, setDoc, getDoc, 
+  doc, onSnapshot, updateDoc, setDoc,
   serverTimestamp, collection, query, where, getDocs, limit,
   orderBy, Timestamp 
 } from 'firebase/firestore';
@@ -26,7 +26,7 @@ import {
 
 
 export default function Dashboard() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, userProfile, loading: authLoading } = useAuth();
   const navigate = useNavigate();
   const [device, setDevice] = useState<any>(null);
   const [history, setHistory] = useState<any[]>([]); // Current hour chart
@@ -56,105 +56,57 @@ export default function Dashboard() {
     }
   }, [user, authLoading, navigate]);
 
-  // Handle Pairing
+  // Handle Pairing — user-centric schema
   const handlePairing = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !pairId || pairId.trim().length < 4) return;
-    
     setPairing(true);
     try {
-      const deviceRef = doc(db, 'devices', pairId.trim());
-      const deviceSnap = await getDoc(deviceRef);
-      
-      if (deviceSnap.exists()) {
-        const data = deviceSnap.data();
-        if (data.ownerId && data.ownerId !== user.uid) {
-           throw new Error("This device is already owned by another user.");
-        }
-        // Claim the existing device (ESP32 might have already sent data)
-        await updateDoc(deviceRef, {
-          ownerId: user.uid,
-          sharedWith: [user.uid]
-        });
-      } else {
-        // Warning for potentially wrong ID
-        const proceed = confirm("Device ID not detected on our servers. This might be a typo, or your ESP32 hasn't connected to the internet yet. Do you want to pair it anyway?");
-        if (!proceed) {
-           setPairing(false);
-           return;
-        }
-
-        // Create new device record with the specific Hardware ID
-        const initialData = {
-          id: pairId.trim(),
-          ownerId: user.uid,
-          sharedWith: [user.uid],
-          name: "Main Device",
-          batteryVoltage: "--",
-          currentFlow: "--",
-          temperature: "--",
-          pressure: "--",
-          humidity: "--",
-          lastUpdate: serverTimestamp()
-        };
-        await setDoc(deviceRef, initialData);
-      }
-      // UI will update via the useEffect listener
+      await pairDevice(user.uid, pairId.trim().toUpperCase());
+      // userProfile.devices updates via onSnapshot in AuthContext → triggers re-render
     } catch (e: any) {
-      console.error("Pairing Error:", e);
-      alert(e.message || "Failed to pair device. Check the ID.");
+      if (e.message === 'DEVICE_NOT_FOUND') {
+        alert("Device ID not found. Double-check the sticker on your Mal Flow box. The device must be registered before pairing.");
+      } else {
+        alert(e.message || "Failed to pair device. Check the ID and try again.");
+      }
     } finally {
       setPairing(false);
     }
   };
 
-  // Load User Device
+  // Load device — reads deviceId from userProfile.devices[] (user-centric schema)
   useEffect(() => {
-    if (!user) return;
+    if (!user || !userProfile) return;
 
+    const deviceIds = userProfile.devices || [];
+    if (deviceIds.length === 0) {
+      setLoading(false);
+      return;
+    }
+
+    const firstDeviceId = deviceIds[0];
     let unsub: () => void;
     let unsubH: () => void;
     let unsubA: () => void;
 
     const setupDevice = async () => {
       try {
-        // ... (existing q setup)
-        let q = query(collection(db, 'devices'), where('sharedWith', 'array-contains', user.uid), limit(1));
-        let querySnapshot = await getDocs(q);
-        
-        let targetRef;
-        if (querySnapshot.empty) {
-          q = query(collection(db, 'devices'), where('ownerId', '==', user.uid), limit(1));
-          querySnapshot = await getDocs(q);
-          if (querySnapshot.empty) { setLoading(false); return; }
-          targetRef = querySnapshot.docs[0].ref;
-        } else {
-          targetRef = querySnapshot.docs[0].ref;
-        }
+        const targetRef = doc(db, 'devices', firstDeviceId);
 
         // Listen to Alerts
-        const alertsRef = collection(db, 'devices', targetRef.id, 'alerts');
+        const alertsRef = collection(db, 'devices', firstDeviceId, 'alerts');
         const alertQuery = query(alertsRef, orderBy('timestamp', 'desc'), limit(15));
         unsubA = onSnapshot(alertQuery, (aSnap) => {
           const fetched = aSnap.docs.map(d => ({ id: d.id, ...d.data() } as any));
           setAlerts(fetched);
-          setUnreadCount(fetched.filter(a => !a.isRead).length);
+          setUnreadCount(fetched.filter((a: any) => !a.isRead).length);
         });
 
-        // Listen to changes
-        unsub = onSnapshot(targetRef, async (snapshot) => {
+        // Listen to device doc
+        unsub = onSnapshot(targetRef, (snapshot) => {
           if (snapshot.exists()) {
-            const data = snapshot.data();
-            
-            // Migration: Ensure sharedWith exists
-            if (!data.sharedWith) {
-              await updateDoc(targetRef, {
-                sharedWith: [user.uid]
-              });
-              return; // wait for next snapshot
-            }
-
-            setDevice(data);
+            setDevice(snapshot.data());
             setLoading(false);
             setError(null);
           } else {
@@ -166,12 +118,12 @@ export default function Dashboard() {
           setError("Permission denied or database error. Check console.");
           setLoading(false);
         });
-        
-        // Listen to History (Last 7 days of Hourly Batches)
-        const historyRef = collection(db, 'devices', targetRef.id, 'history');
-        const hQuery = query(historyRef, orderBy('timestamp', 'desc'), limit(168)); // 24 * 7
+
+        // Listen to History (Last 7 days)
+        const historyRef = collection(db, 'devices', firstDeviceId, 'history');
+        const hQuery = query(historyRef, orderBy('timestamp', 'desc'), limit(168));
         unsubH = onSnapshot(hQuery, (hSnapshot) => {
-          const batches = hSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
+          const batches = hSnapshot.docs.map(d => ({ id: d.id, ...d.data() } as any));
           setAllHistory(batches);
 
           if (!hSnapshot.empty) {
@@ -188,23 +140,18 @@ export default function Dashboard() {
 
       } catch (e: any) {
         console.error("Setup Error:", e);
-        // Special case for Firestore Permission Denied
-        if (e.message?.includes('permissions') || e.code === 'permission-denied') {
-          setError("Database Access Error: Your account doesn't have permission to access this device. Try logging out and back in.");
-        } else {
-          setError(e.message || "Failed to initialize device.");
-        }
+        setError(e.message || "Failed to initialize device.");
         setLoading(false);
       }
     };
 
     setupDevice();
-    return () => { 
-      if (unsub) unsub(); 
+    return () => {
+      if (unsub) unsub();
       if (unsubH) unsubH();
       if (unsubA) unsubA();
     };
-  }, [user]);
+  }, [user, userProfile]);
 
   const markAlertAsRead = async (alertId: string) => {
     if (!device) return;
