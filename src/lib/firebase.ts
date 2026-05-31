@@ -39,7 +39,7 @@ export interface UserProfile {
   email: string;
   displayName: string;
   createdAt: any;
-  devices: string[]; // array of device IDs e.g. ["MF-A3F9", "MF-B7K2"]
+  devices: string[];
 }
 
 export interface MemberProfile {
@@ -103,7 +103,7 @@ const createUserDoc = async (user: User, displayName?: string) => {
       email: user.email,
       displayName: displayName || user.displayName || '',
       createdAt: serverTimestamp(),
-      devices: [] // empty — user will pair their device later
+      devices: []
     });
   }
 };
@@ -130,44 +130,63 @@ export const logout = () => signOut(auth);
 
 // ─── Device Helpers ───────────────────────────────────────────────────────────
 
-/**
- * Get the user's profile doc (includes devices array)
- */
 export const getUserProfile = async (uid: string): Promise<UserProfile | null> => {
   const snap = await getDoc(doc(db, 'users', uid));
   return snap.exists() ? (snap.data() as UserProfile) : null;
 };
 
 /**
- * Pair a device: verify it exists in Firestore (pre-created by ESP32),
- * then add the deviceId to the user's devices array.
- * Sets claimedAt on the device if it was unclaimed.
+ * FIX — pairDevice
+ *
+ * Problema originale: il codice faceva getDoc sul device PRIMA di aggiungerlo
+ * all'array dell'utente. Le rules bloccavano il getDoc perché l'utente non
+ * aveva ancora il device nel suo profilo (userOwnsDevice = false).
+ *
+ * Soluzione: l'ordine delle operazioni è ora:
+ *   1. Controlla che il device esista usando getDocs sulla collezione
+ *      devices con query sull'id — oppure semplicemente tenta l'arrayUnion
+ *      sull'utente prima (operazione sempre permessa su se stessi).
+ *   2. Aggiungi il deviceId all'array dell'utente (PRIMO — sblocca le rules).
+ *   3. Ora userOwnsDevice = true → leggi il device per verificare claimedAt.
+ *   4. Se non era ancora claimed, imposta claimedAt.
  */
 export const pairDevice = async (uid: string, deviceId: string): Promise<void> => {
-  const deviceRef = doc(db, 'devices', deviceId.trim());
-  const deviceSnap = await getDoc(deviceRef);
+  const cleanId = deviceId.trim();
+  const deviceRef = doc(db, 'devices', cleanId);
+  const userRef = doc(db, 'users', uid);
 
-  if (!deviceSnap.exists()) {
+  // STEP 1 — Aggiungi subito il deviceId all'array dell'utente.
+  // Questo è permesso dalle rules (l'utente scrive su se stesso).
+  // Da questo momento userOwnsDevice(cleanId) = true per questo utente.
+  await updateDoc(userRef, {
+    devices: arrayUnion(cleanId)
+  });
+
+  // STEP 2 — Ora che l'utente "possiede" il device, possiamo leggerlo.
+  // Se il device non esiste in Firestore, lo segnaliamo e facciamo rollback.
+  let deviceSnap;
+  try {
+    deviceSnap = await getDoc(deviceRef);
+  } catch (e) {
+    // Rollback: rimuovi il deviceId dall'array se la lettura fallisce
+    await updateDoc(userRef, { devices: arrayRemove(cleanId) });
     throw new Error('DEVICE_NOT_FOUND');
   }
 
-  const data = deviceSnap.data() as DeviceData;
+  if (!deviceSnap.exists()) {
+    // Rollback: device non esiste, rimuovilo dall'array
+    await updateDoc(userRef, { devices: arrayRemove(cleanId) });
+    throw new Error('DEVICE_NOT_FOUND');
+  }
 
-  // Mark as claimed if first pairing
+  // STEP 3 — Imposta claimedAt solo se il device non era ancora claimed.
+  // Le rules permettono questa scrittura solo se claimedAt era null (Fix #1).
+  const data = deviceSnap.data() as DeviceData;
   if (!data.claimedAt) {
     await updateDoc(deviceRef, { claimedAt: serverTimestamp() });
   }
-
-  // Add deviceId to user's array
-  await updateDoc(doc(db, 'users', uid), {
-    devices: arrayUnion(deviceId.trim())
-  });
 };
 
-/**
- * Unpair a device: remove it from the user's devices array.
- * Does NOT touch the device document itself — ESP32 keeps sending data.
- */
 export const unpairDevice = async (uid: string, deviceId: string): Promise<void> => {
   await updateDoc(doc(db, 'users', uid), {
     devices: arrayRemove(deviceId)
@@ -177,73 +196,44 @@ export const unpairDevice = async (uid: string, deviceId: string): Promise<void>
 // ─── Member (Family) Helpers ──────────────────────────────────────────────────
 
 /**
- * Share a device with a family member by email.
- * Creates a member sub-doc under the owner's user doc,
- * and adds the deviceId to the member's own devices array.
+ * FIX — sharDeviceWithMember
+ *
+ * Il vecchio codice faceva updateDoc su /users/{memberUid} direttamente
+ * dal client, operazione bloccata dalle rules (non puoi scrivere nel
+ * profilo di un altro utente). Ora usa la Cloud Function shareDevice
+ * che usa Admin SDK server-side.
+ *
+ * Importa shareDeviceWithMember da sharingService.ts invece di questa.
  */
 export const sharDeviceWithMember = async (
   ownerUid: string,
   deviceId: string,
   memberEmail: string
 ): Promise<void> => {
-  // 1. Find target user by email
-  const usersRef = collection(db, 'users');
-  const q = query(usersRef, where('email', '==', memberEmail), limit(1));
-  const qSnap = await getDocs(q);
-
-  if (qSnap.empty) {
-    throw new Error('USER_NOT_FOUND');
-  }
-
-  const memberData = qSnap.docs[0].data() as UserProfile;
-
-  if (memberData.uid === ownerUid) {
-    throw new Error('CANNOT_ADD_YOURSELF');
-  }
-
-  // 2. Create member entry under owner's subcollection
-  const memberRef = doc(db, 'users', ownerUid, 'members', memberData.uid);
-  await setDoc(memberRef, {
-    uid: memberData.uid,
-    email: memberData.email,
-    displayName: memberData.displayName || '',
-    role: 'viewer',
-    devices: arrayUnion(deviceId),
-    addedAt: serverTimestamp()
-  }, { merge: true }); // merge so existing members just get the new device added
-
-  // 3. Add the deviceId to the member's own devices array so rules allow access
-  await updateDoc(doc(db, 'users', memberData.uid), {
-    devices: arrayUnion(deviceId)
-  });
+  // Questa funzione è mantenuta per compatibilità ma internamente
+  // dovrebbe chiamare la Cloud Function. Usa sharingService.ts direttamente.
+  throw new Error(
+    'Usa shareDeviceWithMember() da sharingService.ts — ' +
+    'questa funzione non può scrivere nel profilo di un altro utente dal client.'
+  );
 };
 
-/**
- * Remove a family member's access to all owner's devices.
- */
 export const removeMember = async (
   ownerUid: string,
   memberUid: string,
   ownerDevices: string[]
 ): Promise<void> => {
-  // 1. Delete the member subdoc
   const memberRef = doc(db, 'users', ownerUid, 'members', memberUid);
   const memberSnap = await getDoc(memberRef);
   if (!memberSnap.exists()) return;
 
-  // 2. Remove all of the owner's devices from the member's devices array
   await updateDoc(doc(db, 'users', memberUid), {
     devices: arrayRemove(...ownerDevices)
   });
 
-  // 3. Delete the member subdoc
-  await updateDoc(memberRef, { devices: [] }); // clear first to be safe
-  // Note: use deleteDoc from 'firebase/firestore' at call site if preferred
+  await updateDoc(memberRef, { devices: [] });
 };
 
-/**
- * Fetch all members for an owner
- */
 export const getMembers = async (ownerUid: string): Promise<MemberProfile[]> => {
   const membersRef = collection(db, 'users', ownerUid, 'members');
   const snap = await getDocs(membersRef);
