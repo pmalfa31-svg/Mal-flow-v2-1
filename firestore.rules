@@ -1,4 +1,5 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -11,76 +12,122 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // Check if the requesting user has the deviceId in their /users/{uid}.devices array
+    // Legge il profilo dell'utente corrente e verifica che deviceId sia nel suo array devices.
+    // Usato sia per il proprietario che per i member (entrambi hanno il deviceId nel loro profilo).
     function userOwnsDevice(deviceId) {
       return isSignedIn() &&
         deviceId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.devices;
     }
 
+    // Verifica se il device esiste già (claimedAt != null).
+    // Usato per impedire sovrascrittura di claimedAt dopo il primo pairing.
+    function deviceAlreadyClaimed(deviceId) {
+      let deviceData = get(/databases/$(database)/documents/devices/$(deviceId)).data;
+      return deviceData.keys().hasAll(['claimedAt']) && deviceData.claimedAt != null;
+    }
+
+
     // ─── USERS ───────────────────────────────────────────────────────────────
 
     match /users/{userId} {
-      // A user can only read/write their own profile
+      // Un utente può leggere solo il proprio profilo
       allow get: if isSignedIn() && request.auth.uid == userId;
 
-      // On signup: create user doc with empty devices array
+      // Al signup: crea il doc utente con devices array vuoto.
+      // Accetta anche createdAt opzionale (il blueprint lo include).
       allow create: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.keys().hasAll(['uid', 'email', 'devices'])
-        && request.resource.data.devices is list;
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.devices is list
+        && request.resource.data.devices.size() == 0;
 
-      // Update: only allowed fields are displayName and devices array
+      // Update: solo displayName e devices array.
+      // NOTA: arrayUnion di un deviceId del member deve avvenire lato server (Admin SDK)
+      // oppure il member scrive nel proprio profilo (request.auth.uid == userId è già garantito).
       allow update: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.diff(resource.data).affectedKeys()
-             .hasOnly(['displayName', 'devices']);
+            .hasOnly(['displayName', 'devices']);
+
+      // Impedisce la cancellazione del profilo da client
+      allow delete: if false;
     }
 
-    // ─── MEMBERS (subcollection of owner's user doc) ──────────────────────────
+
+    // ─── MEMBERS (subcollection del profilo dell'owner) ───────────────────────
 
     match /users/{ownerId}/members/{memberUid} {
-      // The owner can read/write their members list
+      // L'owner può leggere la lista completa dei suoi member e scrivere/cancellare
       allow read, write: if isSignedIn() && request.auth.uid == ownerId;
 
-      // A member can read their own entry (to know their role)
+      // Un member può leggere solo la propria entry (per conoscere il suo ruolo e device assegnati)
       allow get: if isSignedIn() && request.auth.uid == memberUid;
+
+      // I member non possono modificare la propria entry né cancellarla
+      allow update, delete: if isSignedIn() && request.auth.uid == ownerId;
     }
+
 
     // ─── DEVICES ─────────────────────────────────────────────────────────────
 
     match /devices/{deviceId} {
-      // Any user who has this deviceId in their /users/{uid}.devices array can read it
+      // Lettura consentita a qualunque utente che ha questo deviceId nel suo profilo
       allow get: if userOwnsDevice(deviceId);
 
-      // list is not needed — we always fetch by specific ID from the user's devices array
+      // List bloccato: si accede sempre per ID specifico dall'array dell'utente
       allow list: if false;
 
-      // The web app NEVER creates device documents — the ESP32 does via Admin SDK
+      // Creazione solo via Admin SDK (ESP32 pipeline) — mai dal web client
       allow create: if false;
 
-      // Users with access can update only name and settings
-      // Only the "owner" (first to pair) can update settings
+      // Update: solo name, settings.
+      // claimedAt può essere scritto SOLO se il device non è ancora stato claimed
+      // (primo pairing). Non modificabile dopo.
       allow update: if userOwnsDevice(deviceId)
-        && request.resource.data.diff(resource.data).affectedKeys()
-             .hasOnly(['name', 'settings', 'claimedAt']);
+        && (
+          // Caso 1: aggiorna solo name e/o settings (sempre permesso a chi ha accesso)
+          request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['name', 'settings'])
+          ||
+          // Caso 2: il pairing iniziale — include claimedAt solo se era null o assente
+          (
+            request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['name', 'settings', 'claimedAt'])
+            && !deviceAlreadyClaimed(deviceId)
+          )
+        );
+
+      // Cancellazione solo via Admin SDK
+      allow delete: if false;
+
 
       // ── History subcollection ──────────────────────────────────────────────
+
       match /history/{recordId} {
-        // Readable by any user who has access to the device
+        // Lettura per qualunque utente con accesso al device
         allow read: if userOwnsDevice(deviceId);
-        // Written only by Admin SDK (ESP32 pipeline) — never by the web client
+
+        // Scrittura solo via Admin SDK (ESP32 pipeline)
         allow write: if false;
       }
 
+
       // ── Alerts subcollection ───────────────────────────────────────────────
+
       match /alerts/{alertId} {
         allow read: if userOwnsDevice(deviceId);
-        // Web client can only mark alerts as read
+
+        // Il client può solo segnare un alert come letto (isRead = true)
         allow update: if userOwnsDevice(deviceId)
-          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
-        // Creation only via Admin SDK
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['isRead'])
+          && request.resource.data.isRead == true;
+
+        // Creazione e cancellazione solo via Admin SDK
         allow create, delete: if false;
       }
     }
+
   }
 }
