@@ -1,0 +1,21 @@
+{
+  "name": "mal-flow-functions",
+  "version": "1.0.0",
+  "description": "Firebase Cloud Functions per Mal-flow v2.1",
+  "main": "lib/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "serve": "npm run build && firebase emulators:start --only functions",
+    "deploy": "firebase deploy --only functions"
+  },
+  "engines": { "node": "20" },
+  "dependencies": {
+    "firebase-admin": "^13.8.0",
+    "firebase-functions": "^6.3.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.8.2",
+    "@types/node": "^22.14.0"
+  }
+}

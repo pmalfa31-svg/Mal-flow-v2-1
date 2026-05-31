@@ -3,94 +3,99 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Default deny all
+    // ── Default deny ──────────────────────────────────────────────────────────
     match /{document=**} {
       allow read, write: if false;
     }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     function isSignedIn() {
       return request.auth != null;
     }
 
-    // Legge il profilo dell'utente corrente e verifica che deviceId sia nel suo array devices.
-    // Usato sia per il proprietario che per i member (entrambi hanno il deviceId nel loro profilo).
+    // Legge il profilo dell'utente corrente e verifica che deviceId
+    // sia nel suo array .devices. Funziona sia per owner che per member
+    // (entrambi hanno il deviceId nel proprio profilo dopo il pairing/share).
     function userOwnsDevice(deviceId) {
       return isSignedIn() &&
-        deviceId in get(/databases/$(database)/documents/users/$(request.auth.uid)).data.devices;
+        deviceId in get(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        ).data.devices;
     }
 
-    // Verifica se il device esiste già (claimedAt != null).
-    // Usato per impedire sovrascrittura di claimedAt dopo il primo pairing.
+    // FIX #1 — helper per verificare se claimedAt è già stato settato.
+    // Restituisce true se il device è già reclamato da qualcuno.
+    // Usato per rendere claimedAt immutabile dopo il primo pairing.
     function deviceAlreadyClaimed(deviceId) {
-      let deviceData = get(/databases/$(database)/documents/devices/$(deviceId)).data;
-      return deviceData.keys().hasAll(['claimedAt']) && deviceData.claimedAt != null;
+      let d = get(/databases/$(database)/documents/devices/$(deviceId)).data;
+      return d.keys().hasAll(['claimedAt']) && d.claimedAt != null;
     }
 
 
-    // ─── USERS ───────────────────────────────────────────────────────────────
+    // ── USERS ─────────────────────────────────────────────────────────────────
 
     match /users/{userId} {
-      // Un utente può leggere solo il proprio profilo
+
       allow get: if isSignedIn() && request.auth.uid == userId;
 
-      // Al signup: crea il doc utente con devices array vuoto.
-      // Accetta anche createdAt opzionale (il blueprint lo include).
+      // FIX #3 — verifica che uid nel documento corrisponda all'UID Auth reale,
+      // e che devices sia un array vuoto al momento della creazione.
       allow create: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.keys().hasAll(['uid', 'email', 'devices'])
         && request.resource.data.uid == request.auth.uid
         && request.resource.data.devices is list
-        && request.resource.data.devices.size() == 0;
+        && request.resource.data.devices.size() == 0;   // FIX #5
 
-      // Update: solo displayName e devices array.
-      // NOTA: arrayUnion di un deviceId del member deve avvenire lato server (Admin SDK)
-      // oppure il member scrive nel proprio profilo (request.auth.uid == userId è già garantito).
+      // Un utente può aggiornare solo displayName e il proprio array devices.
+      // L'aggiunta del deviceId di un member al suo profilo avviene lato server
+      // tramite Admin SDK (Cloud Function shareDevice) — non da client.
       allow update: if isSignedIn()
         && request.auth.uid == userId
         && request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['displayName', 'devices']);
 
-      // Impedisce la cancellazione del profilo da client
       allow delete: if false;
     }
 
 
-    // ─── MEMBERS (subcollection del profilo dell'owner) ───────────────────────
+    // ── MEMBERS (subcollection del profilo owner) ──────────────────────────────
 
     match /users/{ownerId}/members/{memberUid} {
-      // L'owner può leggere la lista completa dei suoi member e scrivere/cancellare
+      // L'owner legge/scrive/cancella la propria lista di member
       allow read, write: if isSignedIn() && request.auth.uid == ownerId;
 
-      // Un member può leggere solo la propria entry (per conoscere il suo ruolo e device assegnati)
+      // Un member può leggere solo la propria entry (per conoscere ruolo e device)
       allow get: if isSignedIn() && request.auth.uid == memberUid;
 
-      // I member non possono modificare la propria entry né cancellarla
+      // I member non possono modificare né cancellare la propria entry
       allow update, delete: if isSignedIn() && request.auth.uid == ownerId;
     }
 
 
-    // ─── DEVICES ─────────────────────────────────────────────────────────────
+    // ── DEVICES ───────────────────────────────────────────────────────────────
 
     match /devices/{deviceId} {
-      // Lettura consentita a qualunque utente che ha questo deviceId nel suo profilo
+
+      // Lettura solo per chi ha il device nel proprio profilo
       allow get: if userOwnsDevice(deviceId);
 
-      // List bloccato: si accede sempre per ID specifico dall'array dell'utente
+      // List disabilitato: si accede sempre per ID specifico dall'array utente
       allow list: if false;
 
-      // Creazione solo via Admin SDK (ESP32 pipeline) — mai dal web client
+      // Creazione solo via Admin SDK (ESP32 pipeline)
       allow create: if false;
 
-      // Update: solo name, settings.
-      // claimedAt può essere scritto SOLO se il device non è ancora stato claimed
-      // (primo pairing). Non modificabile dopo.
+      // FIX #1 — Update:
+      //  - name e settings: sempre modificabili da chi ha accesso
+      //  - claimedAt: scrivibile UNA SOLA VOLTA (solo se ancora null/assente)
+      //    Dopo il primo pairing diventa immutabile da client.
       allow update: if userOwnsDevice(deviceId)
         && (
-          // Caso 1: aggiorna solo name e/o settings (sempre permesso a chi ha accesso)
           request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['name', 'settings'])
           ||
-          // Caso 2: il pairing iniziale — include claimedAt solo se era null o assente
           (
             request.resource.data.diff(resource.data).affectedKeys()
                 .hasOnly(['name', 'settings', 'claimedAt'])
@@ -98,34 +103,30 @@ service cloud.firestore {
           )
         );
 
-      // Cancellazione solo via Admin SDK
       allow delete: if false;
 
 
-      // ── History subcollection ──────────────────────────────────────────────
+      // ── History subcollection ────────────────────────────────────────────────
 
       match /history/{recordId} {
-        // Lettura per qualunque utente con accesso al device
         allow read: if userOwnsDevice(deviceId);
-
-        // Scrittura solo via Admin SDK (ESP32 pipeline)
-        allow write: if false;
+        allow write: if false;   // solo Admin SDK
       }
 
 
-      // ── Alerts subcollection ───────────────────────────────────────────────
+      // ── Alerts subcollection ─────────────────────────────────────────────────
 
       match /alerts/{alertId} {
         allow read: if userOwnsDevice(deviceId);
 
-        // Il client può solo segnare un alert come letto (isRead = true)
+        // FIX #4 — il client può solo impostare isRead = true,
+        // non ripristinare a false né toccare altri campi.
         allow update: if userOwnsDevice(deviceId)
           && request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['isRead'])
           && request.resource.data.isRead == true;
 
-        // Creazione e cancellazione solo via Admin SDK
-        allow create, delete: if false;
+        allow create, delete: if false;   // solo Admin SDK
       }
     }
 
